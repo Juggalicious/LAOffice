@@ -1,9 +1,21 @@
-<?php ini_set('display_errors', 0);?>
-<?php mysqli_report(MYSQLI_REPORT_OFF);?>
-<?php include('includes/helpers/PHPMailerAutoload.php');?>
-<?php include('includes/helpers/integrations/zapier/triggers/functions.php');?>
+<?php 
+	// Set maximum execution time to prevent CPU limit exceeded
+	set_time_limit(300); // 5 minutes max
+	ini_set('max_execution_time', 300);
+	ini_set('display_errors', 0);
+	ini_set('memory_limit', '256M'); // Increase if needed
+	
+	mysqli_report(MYSQLI_REPORT_OFF);
+	include('includes/helpers/PHPMailerAutoload.php');
+	include('includes/helpers/integrations/zapier/triggers/functions.php');
+?>
 <?php 
 	include('includes/config.php');
+	
+	// Track script start time to prevent timeout
+	$script_start_time = time();
+	$max_execution_seconds = 280; // Leave buffer before hard limit
+	
 	//--------------------------------------------------------------//
 	function dbConnect() { //Connect to database
 	//--------------------------------------------------------------//
@@ -63,13 +75,21 @@
 			{
 				$q2 = 'UPDATE login SET cron=1 WHERE id = '.$userid;
 				$r2 = mysqli_query($mysqli, $q2);
-				if ($r2) exit;
+				if ($r2) {
+					// Successfully locked cron
+				} else {
+					// Another process is running
+					exit;
+				}
+			} else {
+				// Cron already running, exit to prevent overlap
+				exit;
 			}
 	    }  
 	}
 	
 	$the_offset = '';
-	$offset = isset($_GET['offset']) ? $_GET['offset'] : '';
+	$offset = isset($_GET['offset']) ? intval($_GET['offset']) : 0;
 	
 	function get_google_translate_url($url, $translate_to_lang)
 	{
@@ -85,8 +105,8 @@
 		else return $url;
 	}
 	
-	//Check campaigns database
-	$q = 'SELECT timezone, sent, id, app, userID, to_send, to_send_lists, recipients, timeout_check, send_date, lists, lists_excl, segs, segs_excl, from_name, from_email, reply_to, title, label, plain_text, html_text, query_string, opens_tracking, links_tracking, web_version_lang FROM campaigns WHERE (send_date !="" AND lists !="" AND timezone != "") OR (to_send > recipients) ORDER BY sent DESC';
+	//Check campaigns database - LIMIT to 1 campaign per execution to prevent timeout
+	$q = 'SELECT timezone, sent, id, app, userID, to_send, to_send_lists, recipients, timeout_check, send_date, lists, lists_excl, segs, segs_excl, from_name, from_email, reply_to, title, label, plain_text, html_text, query_string, opens_tracking, links_tracking, web_version_lang FROM campaigns WHERE (send_date !="" AND lists !="" AND timezone != "") OR (to_send > recipients) ORDER BY sent DESC LIMIT 1';
 	$r = mysqli_query($mysqli, $q);
 	if ($r && mysqli_num_rows($r) > 0)
 	{
@@ -189,7 +209,7 @@
 			$sent_formatted = date("D, M d, Y, h:iA", time());
 			$web_version = get_google_translate_url($app_path.'/w/'.encrypt_val($campaign_id), $web_version_lang);
 			
-			if($offset=='') //If sending for the first time
+			if($offset==0) //If sending for the first time
 				$main_query = $email_list == 0 ? '' : 'subscribers.list in ('.$email_list.') '; //Include main list query
 			else //If resuming
 				$main_query = $to_send_lists == '' ? '' : 'subscribers.list in ('.$to_send_lists.') '; //Include main list query
@@ -209,7 +229,7 @@
 			if((($time>=$send_date && $time<$send_date+300) && $sent=='') || (($send_date<$time) && $sent=='') || ($send_date=='0' && $timezone=='0'))
 			{
 				//if resuming
-				if($offset!='')
+				if($offset!=0)
 					$q = 'UPDATE campaigns SET send_date=NULL, lists=NULL, timezone=NULL WHERE id = '.$campaign_id;
 				else
 					$q = 'UPDATE campaigns SET sent = "'.$time.'", send_date=NULL, lists=NULL, timezone=NULL WHERE id = '.$campaign_id;
@@ -217,7 +237,7 @@
 				if ($r){}
 				
 				//if sending for the first time
-				if($offset=='')
+				if($offset==0)
 				{							
 					//If links tracking is enabled, insert links into database
 					if($links_tracking)
@@ -242,7 +262,7 @@
 							{								
 								$var_array = explode('#', $var);
 								$url_part_1 = $var_array[0];
-								$url_part_2 = $var_array[1];
+								$url_part_2 = isset($var_array[1]) ? $var_array[1] : '';
 								$anchor = strpos($var,'#') !== false ? '#' : '';
 								if(strpos($var,'?') !== false) $var = $url_part_1.'&'.$query_string.$anchor.$url_part_2;
 								else $var = $url_part_1.'?'.$query_string.$anchor.$url_part_2;
@@ -257,7 +277,7 @@
 						//extract unique links
 						for($i=0;$i<count($links);$i++)
 						{
-						    $q = 'INSERT INTO links (campaign_id, link) VALUES ('.$campaign_id.', "'.$links[$i].'")';
+						    $q = 'INSERT INTO links (campaign_id, link) VALUES ('.$campaign_id.', "'.mysqli_real_escape_string($mysqli, $links[$i]).'")';
 						    $r = mysqli_query($mysqli, $q);
 						    if ($r){}
 						}
@@ -270,8 +290,7 @@
 					$q .= $exclude_query != '' || $exclude_seg_query != '' ? 'AND ('.$exclude_query.$exclude_seg_query.') ' : '';
 					$q .= 'AND subscribers.unsubscribed = 0 AND subscribers.bounced = 0 AND subscribers.complaint = 0 AND subscribers.confirmed = 1 '.$gdpr_line.'
 						   GROUP BY subscribers.email 
-						   ORDER BY subscribers.id ASC 
-						   LIMIT 18446744073709551615'.$the_offset;
+						   ORDER BY subscribers.id ASC';
 					$r = mysqli_query($mysqli, $q);
 					if ($r)
 					{
@@ -319,6 +338,10 @@
 					$the_offset = ' OFFSET '.($offset-($currently_unsubscribed+$currently_bounced+$currently_complaint));	
 				}
 				
+				// Batch processing to prevent timeout
+				$batch_size = 100; // Process 100 emails at a time
+				$emails_sent_this_run = 0;
+				
 				//Replace links in newsletter and put tracking image
 				$q  = 'SELECT subscribers.id, subscribers.name, subscribers.email, subscribers.list, subscribers.custom_fields FROM subscribers';
 				$q .= $segs==0 && $segs_excl==0 ? ' ' : ' LEFT JOIN subscribers_seg ON (subscribers.id = subscribers_seg.subscriber_id) ';
@@ -327,7 +350,7 @@
 				$q .= 'AND subscribers.unsubscribed = 0 AND subscribers.bounced = 0 AND subscribers.complaint = 0 AND subscribers.confirmed = 1 '.$gdpr_line.'
 					   GROUP BY subscribers.email 
 					   ORDER BY subscribers.id ASC 
-					   LIMIT 18446744073709551615'.$the_offset;
+					   LIMIT '.$batch_size.$the_offset;
 				$r = mysqli_query($mysqli, $q);
 				if ($r && mysqli_num_rows($r) > 0)
 				{
@@ -337,8 +360,29 @@
 					
 				    while($row = mysqli_fetch_array($r))
 				    {
-				    	//prevent execution timeout
-				    	set_time_limit(0);
+				    	// Check if we're approaching timeout
+				    	if ((time() - $script_start_time) > $max_execution_seconds) {
+					    	// Update campaign to resume later
+					    	$new_offset = $current_recipient_count + $emails_sent_this_run;
+					    	$q_timeout = 'UPDATE campaigns SET send_date = "0", timezone = "0", timeout_check = "'.$new_offset.':'.($timeout_check ? $timeout_check : '0').'" WHERE id = '.$campaign_id;
+					    	mysqli_query($mysqli, $q_timeout);
+					    	
+					    	// Release cron lock
+					    	mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+					    	
+					    	// Trigger next execution
+					    	$ch = curl_init();
+							curl_setopt($ch, CURLOPT_HEADER, 0);
+							curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+							curl_setopt($ch, CURLOPT_URL, $app_path.'/scheduled.php?offset='.$new_offset);
+							curl_setopt($ch, CURLOPT_TIMEOUT, 1);
+							curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+							curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+							curl_exec($ch);
+							curl_close($ch);
+					    	
+					    	exit;
+				    	}
 						
 						//Check if 'stop campaign' is initiated
 						$qc = 'SELECT campaign_stopped, recipients FROM campaigns WHERE id = '.$campaign_id;
@@ -379,6 +423,9 @@
 								
 								//Run rules
 								run_rule($rules_data);
+								
+								// Release cron lock before exiting
+								mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
 								
 								//Exit script to stop campaign from sending further
 								exit;
@@ -425,9 +472,6 @@
 						}
 						
 						//tags for subject
-						preg_match_all('/\[([a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+),\s*fallback=/i', $title_treated, $matches_var, PREG_PATTERN_ORDER);
-						preg_match_all('/,\s*fallback=([a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*)\]/i', $title_treated, $matches_val, PREG_PATTERN_ORDER);
-						preg_match_all('/(\[[a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+,\s*fallback=[a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*\])/i', $title_treated, $matches_all, PREG_PATTERN_ORDER);
 						preg_match_all('/\[([^\]]+),\s*fallback=/i', $title_treated, $matches_var, PREG_PATTERN_ORDER);
 						preg_match_all('/,\s*fallback=([^\]]*)\]/i', $title_treated, $matches_val, PREG_PATTERN_ORDER);
 						preg_match_all('/(\[[^\]]+,\s*fallback=[^\]]*\])/i', $title_treated, $matches_all, PREG_PATTERN_ORDER);
@@ -499,9 +543,6 @@
 						}
 						
 						//tags for HTML
-						preg_match_all('/\[([a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+),\s*fallback=/i', $html_treated, $matches_var, PREG_PATTERN_ORDER);
-						preg_match_all('/,\s*fallback=([a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*)\]/i', $html_treated, $matches_val, PREG_PATTERN_ORDER);
-						preg_match_all('/(\[[a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+,\s*fallback=[a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*\])/i', $html_treated, $matches_all, PREG_PATTERN_ORDER);
 						preg_match_all('/\[([^\]]+),\s*fallback=/i', $html_treated, $matches_var, PREG_PATTERN_ORDER);
 						preg_match_all('/,\s*fallback=([^\]]*)\]/i', $html_treated, $matches_val, PREG_PATTERN_ORDER);
 						preg_match_all('/(\[[^\]]+,\s*fallback=[^\]]*\])/i', $html_treated, $matches_all, PREG_PATTERN_ORDER);
@@ -572,9 +613,6 @@
 							}
 						}
 						//tags for Plain text
-						preg_match_all('/\[([a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+),\s*fallback=/i', $plain_treated, $matches_var, PREG_PATTERN_ORDER);
-						preg_match_all('/,\s*fallback=([a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*)\]/i', $plain_treated, $matches_val, PREG_PATTERN_ORDER);
-						preg_match_all('/(\[[a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+,\s*fallback=[a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*\])/i', $plain_treated, $matches_all, PREG_PATTERN_ORDER);
 						preg_match_all('/\[([^\]]+),\s*fallback=/i', $plain_treated, $matches_var, PREG_PATTERN_ORDER);
 						preg_match_all('/,\s*fallback=([^\]]*)\]/i', $plain_treated, $matches_val, PREG_PATTERN_ORDER);
 						preg_match_all('/(\[[^\]]+,\s*fallback=[^\]]*\])/i', $plain_treated, $matches_all, PREG_PATTERN_ORDER);
@@ -762,16 +800,23 @@
 							$q14 = 'UPDATE subscribers SET last_campaign = '.$campaign_id.' WHERE id = '.$subscriber_id;
 							mysqli_query($mysqli, $q14);
 						}
+						
+						$emails_sent_this_run++;
 				    }  
 				    
 				    //====================== Send remaining in queue ======================//
 				    
-				    $q4 = 'SELECT id, query_str, http_headers, subscriber_id FROM queue WHERE campaign_id = '.$campaign_id.' AND sent = 0';
+				    $q4 = 'SELECT id, query_str, http_headers, subscriber_id FROM queue WHERE campaign_id = '.$campaign_id.' AND sent = 0 LIMIT 50';
 				    $r4 = mysqli_query($mysqli, $q4);
 				    if ($r4 && mysqli_num_rows($r4) > 0)
 				    {
 				        while($row = mysqli_fetch_array($r4))
 				        {
+				        	// Check timeout before processing queue
+				        	if ((time() - $script_start_time) > $max_execution_seconds) {
+						    	break; // Exit queue processing
+					    	}
+					    	
 				        	$request_url = 'https://'.$ses_endpoint;
 				    		$queue_id = $row['id'];
 				    		$query_str = stripslashes($row['query_str']);
@@ -796,7 +841,7 @@
 					        //Get message ID from response
 					        $messageIDArray = explode('<MessageId>', $response);
 					        $messageIDArray2 = explode('</MessageId>', $messageIDArray[1]);
-					        $messageID = $messageIDArray2[0];
+					        $messageID = isset($messageIDArray2[0]) ? $messageIDArray2[0] : '';
 					        
 					        $response_http_status_code = curl_getinfo($cr, CURLINFO_HTTP_CODE);
 					        
@@ -838,21 +883,40 @@
 								$q14 = 'UPDATE subscribers SET messageID = "'.$messageID.'" WHERE id = '.$subscriber_id;
 								mysqli_query($mysqli, $q14);
 					        }
+					        
+					        curl_close($cr);
 				        }  
 				    }
-				    else
-				    {
-					    $q12 = 'UPDATE campaigns SET to_send = (SELECT recipients) WHERE id = '.$campaign_id;
-						$r12 = mysqli_query($mysqli, $q12);
-						if ($r12)
-						{
-							$q13 = 'SELECT recipients FROM campaigns WHERE id = '.$campaign_id;
-							$r13 = mysqli_query($mysqli, $q13);
-							if ($r13) while($row = mysqli_fetch_array($r13)) $current_recipient_count = $row['recipients'];
-							$to_send = $current_recipient_count;
-							$to_send_num = $current_recipient_count;
+				    
+				    // Check if we need to continue in next execution
+				    $q12 = 'SELECT recipients, to_send FROM campaigns WHERE id = '.$campaign_id;
+					$r12 = mysqli_query($mysqli, $q12);
+					if ($r12)
+					{
+						while($row = mysqli_fetch_array($r12)) {
+							$current_recipient_count = $row['recipients'];
+							$to_send = $row['to_send'];
 						}
-				    }
+						
+						// If more emails to send, trigger next batch
+						if($current_recipient_count < $to_send)
+						{
+							// Release cron lock before triggering next run
+							mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+							
+							// Trigger next batch
+							$ch = curl_init();
+							curl_setopt($ch, CURLOPT_HEADER, 0);
+							curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+							curl_setopt($ch, CURLOPT_URL, $app_path.'/scheduled.php?offset='.$current_recipient_count);
+							curl_setopt($ch, CURLOPT_TIMEOUT, 1);
+							curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+							curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+							curl_exec($ch);
+							curl_close($ch);
+							exit;
+						}
+					}
 				    //======================= /Send remaining in queue ======================//
 				}
 				else
@@ -874,9 +938,6 @@
 			    if($no_of_recipients >= $to_send)
 			    {
 				    //tags for subject to me
-					preg_match_all('/\[([a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+),\s*fallback=/i', $title, $matches_var, PREG_PATTERN_ORDER);
-					preg_match_all('/,\s*fallback=([a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*)\]/i', $title, $matches_val, PREG_PATTERN_ORDER);
-					preg_match_all('/(\[[a-zA-Z0-9!#%^&*()+=$@._\-\:|\/?<>~`"\'\s]+,\s*fallback=[a-zA-Z0-9!,#%^&*()+=$@._\-\:|\/?<>~`"\'\s]*\])/i', $title, $matches_all, PREG_PATTERN_ORDER);
 					preg_match_all('/\[([^\]]+),\s*fallback=/i', $title, $matches_var, PREG_PATTERN_ORDER);
 					preg_match_all('/,\s*fallback=([^\]]*)\]/i', $title, $matches_val, PREG_PATTERN_ORDER);
 					preg_match_all('/(\[[^\]]+,\s*fallback=[^\]]*\])/i', $title, $matches_all, PREG_PATTERN_ORDER);
@@ -959,6 +1020,9 @@
 				    //Run rules
 					run_rule($rules_data);
 					
+					// Release cron lock on completion
+					mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+					
 					//quit
 					exit;
 				}
@@ -966,21 +1030,14 @@
 			    //========================== /Post processing ===========================//
 			}
 			
-			//check if sending timed out			
-			if($current_recipient_count > 0 && $current_recipient_count < $to_send_num && $offset == '')
+			//check if sending timed out - IMPROVED LOGIC			
+			if($current_recipient_count > 0 && $current_recipient_count < $to_send_num && $offset == 0)
 			{
 				//check time out
-				$tc_array = is_string($timeout_check) ? explode(':', $timeout_check) : [];
+				$timeout_check = is_string($timeout_check) ? $timeout_check : '';
+				$tc_array = $timeout_check != '' ? explode(':', $timeout_check) : array();
 					
-				// Initialize default values for $tc_prev
-				$tc_prev = '0'; // Set a sensible default value for $tc_prev
-				if (isset($tc_array[0])) {
-					$tc_prev = $tc_array[0];
-				} else {
-				    // Log details if $tc_array[0] is missing
-				    error_log("Warning: \$tc_array[0] is not set. \$timeout_check value: " . var_export($timeout_check, true));
-				    error_log("Debug: \$tc_array = " . var_export($tc_array, true));
-			    }
+				$tc_prev = isset($tc_array[0]) ? $tc_array[0] : '0';
 				$tc_now = $current_recipient_count;
 				$tc = $tc_now.':'.$tc_prev;
 				
@@ -989,20 +1046,25 @@
 				mysqli_query($mysqli, $q);
 				
 				//compare prev count with current recipients number count
-				//if timed out
-				if($tc_now == $tc_prev)
+				//if timed out (no progress made)
+				if($tc_now == $tc_prev && $tc_prev != '0')
 				{
 					$q = 'UPDATE campaigns SET timeout_check = NULL, send_date = "0", timezone = "0" WHERE id = '.$campaign_id;
 					mysqli_query($mysqli, $q);
+					
+					// Release cron lock before retry
+					mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
 					
 					//continue sending
 					$ch = curl_init();
 					curl_setopt($ch, CURLOPT_HEADER, 0);
 					curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
 					curl_setopt($ch, CURLOPT_URL, $app_path.'/scheduled.php?offset='.$current_recipient_count);
+					curl_setopt($ch, CURLOPT_TIMEOUT, 1);
 					curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
 					curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
-					$data = curl_exec($ch);
+					curl_exec($ch);
+					curl_close($ch);
 				}
 			}
 			else if($current_recipient_count == $to_send_num)
@@ -1011,5 +1073,10 @@
 				mysqli_query($mysqli, $q);
 			}
 	    }  
+	}
+	
+	// Release cron lock at end of script
+	if(isset($userid)) {
+		mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
 	}
 ?>
