@@ -88,8 +88,9 @@
 	    }  
 	}
 	
+	// Offset should be determined automatically from database, not from URL
 	$the_offset = '';
-	$offset = isset($_GET['offset']) ? intval($_GET['offset']) : 0;
+	$offset = 0;
 	
 	function get_google_translate_url($url, $translate_to_lang)
 	{
@@ -209,10 +210,18 @@
 			$sent_formatted = date("D, M d, Y, h:iA", time());
 			$web_version = get_google_translate_url($app_path.'/w/'.encrypt_val($campaign_id), $web_version_lang);
 			
-			if($offset==0) //If sending for the first time
-				$main_query = $email_list == 0 ? '' : 'subscribers.list in ('.$email_list.') '; //Include main list query
-			else //If resuming
-				$main_query = $to_send_lists == '' ? '' : 'subscribers.list in ('.$to_send_lists.') '; //Include main list query
+			// Automatically determine if we're resuming based on recipients count
+			// If recipients > 0, we're resuming from where we left off
+			$is_resuming = ($current_recipient_count > 0 && $current_recipient_count < $to_send_num);
+			$offset = $is_resuming ? $current_recipient_count : 0;
+			
+			if($is_resuming) {
+				// If resuming, use the saved to_send_lists
+				$main_query = $to_send_lists == '' ? '' : 'subscribers.list in ('.$to_send_lists.') ';
+			} else {
+				// If sending for the first time, use the current email_list
+				$main_query = $email_list == 0 ? '' : 'subscribers.list in ('.$email_list.') ';
+			}
 			
 			//Include segmentation query
 			$seg_query = $main_query != '' && $segs != 0 ? 'OR ' : '';
@@ -228,8 +237,8 @@
 			//check if we should send email now
 			if((($time>=$send_date && $time<$send_date+300) && $sent=='') || (($send_date<$time) && $sent=='') || ($send_date=='0' && $timezone=='0'))
 			{
-				//if resuming
-				if($offset!=0)
+				//if resuming, keep the send_date/lists/timezone clear
+				if($is_resuming)
 					$q = 'UPDATE campaigns SET send_date=NULL, lists=NULL, timezone=NULL WHERE id = '.$campaign_id;
 				else
 					$q = 'UPDATE campaigns SET sent = "'.$time.'", send_date=NULL, lists=NULL, timezone=NULL WHERE id = '.$campaign_id;
@@ -237,7 +246,7 @@
 				if ($r){}
 				
 				//if sending for the first time
-				if($offset==0)
+				if(!$is_resuming)
 				{							
 					//If links tracking is enabled, insert links into database
 					if($links_tracking)
@@ -325,13 +334,13 @@
 				{
 					//if resuming					
 					$email_list = $to_send_lists;
-					//get currently unsubscribed
+					//get currently unsubscribed since campaign started
 					$uc = 'SELECT id FROM subscribers WHERE unsubscribed = 1 AND last_campaign = '.$campaign_id;
 				    $currently_unsubscribed = mysqli_num_rows(mysqli_query($mysqli, $uc));
-				    //get currently bounced
+				    //get currently bounced since campaign started
 					$bc = 'SELECT id FROM subscribers WHERE bounced = 1 AND last_campaign = '.$campaign_id;
 				    $currently_bounced = mysqli_num_rows(mysqli_query($mysqli, $bc));
-				    //get currently complaint
+				    //get currently complaint since campaign started
 					$cc = 'SELECT id FROM subscribers WHERE complaint = 1 AND last_campaign = '.$campaign_id;
 				    $currently_complaint = mysqli_num_rows(mysqli_query($mysqli, $cc));
 					//calculate offset (offset should exclude currently unsubscribed, bounced or complaint)
@@ -362,25 +371,15 @@
 				    {
 				    	// Check if we're approaching timeout
 				    	if ((time() - $script_start_time) > $max_execution_seconds) {
-					    	// Update campaign to resume later
+					    	// Update campaign to resume later - cron will pick it up automatically
 					    	$new_offset = $current_recipient_count + $emails_sent_this_run;
 					    	$q_timeout = 'UPDATE campaigns SET send_date = "0", timezone = "0", timeout_check = "'.$new_offset.':'.($timeout_check ? $timeout_check : '0').'" WHERE id = '.$campaign_id;
 					    	mysqli_query($mysqli, $q_timeout);
 					    	
-					    	// Release cron lock
+					    	// Release cron lock so next cron run can continue
 					    	mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
 					    	
-					    	// Trigger next execution
-					    	$ch = curl_init();
-							curl_setopt($ch, CURLOPT_HEADER, 0);
-							curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-							curl_setopt($ch, CURLOPT_URL, $app_path.'/scheduled.php?offset='.$new_offset);
-							curl_setopt($ch, CURLOPT_TIMEOUT, 1);
-							curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
-							curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
-							curl_exec($ch);
-							curl_close($ch);
-					    	
+					    	// Exit - cron will automatically resume on next run
 					    	exit;
 				    	}
 						
@@ -895,24 +894,14 @@
 							$to_send_actual = $row['to_send'];
 						}
 						
-						// If more emails to send, trigger next batch
+						// If more emails to send, release lock and let cron continue
 						if($current_recipient_count < $to_send_actual)
 						{
-							// Release cron lock before triggering next run
+							// Release cron lock - next cron run will continue automatically
 							mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
 							
-							// Trigger next batch
-							$ch = curl_init();
-							curl_setopt($ch, CURLOPT_HEADER, 0);
-							curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-							curl_setopt($ch, CURLOPT_URL, $app_path.'/scheduled.php?offset='.$current_recipient_count);
-							curl_setopt($ch, CURLOPT_TIMEOUT, 1);
-							curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
-							curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
-							curl_exec($ch);
-							curl_close($ch);
-							
-							// IMPORTANT: Exit immediately to prevent post-processing
+							// Exit immediately to prevent post-processing
+							// Cron will pick up and continue on next run
 							exit;
 						}
 						// If we reach here, campaign is complete - continue to post-processing
@@ -1041,7 +1030,7 @@
 			}
 			
 			//check if sending timed out - IMPROVED LOGIC			
-			if($current_recipient_count > 0 && $current_recipient_count < $to_send_num && $offset == 0)
+			if($current_recipient_count > 0 && $current_recipient_count < $to_send_num && !$is_resuming)
 			{
 				//check time out
 				$timeout_check = is_string($timeout_check) ? $timeout_check : '';
@@ -1062,19 +1051,8 @@
 					$q = 'UPDATE campaigns SET timeout_check = NULL, send_date = "0", timezone = "0" WHERE id = '.$campaign_id;
 					mysqli_query($mysqli, $q);
 					
-					// Release cron lock before retry
+					// Release cron lock - next cron run will retry automatically
 					mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
-					
-					//continue sending
-					$ch = curl_init();
-					curl_setopt($ch, CURLOPT_HEADER, 0);
-					curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-					curl_setopt($ch, CURLOPT_URL, $app_path.'/scheduled.php?offset='.$current_recipient_count);
-					curl_setopt($ch, CURLOPT_TIMEOUT, 1);
-					curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
-					curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
-					curl_exec($ch);
-					curl_close($ch);
 				}
 			}
 			else if($current_recipient_count == $to_send_num)
