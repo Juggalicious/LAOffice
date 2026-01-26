@@ -789,17 +789,14 @@
 						}
 						$mail->Send();
 						
-						//increment recipient count if not using AWS or SMTP
-						if(($s3_key=='' && $s3_secret=='') || ($smtp_host!='' && $smtp_port!='' && $smtp_username!='' && $smtp_password!=''))
-						{
-							//increment recipients number in campaigns table
-							$q5 = 'UPDATE campaigns SET recipients = recipients+1 WHERE id = '.$campaign_id;
-							mysqli_query($mysqli, $q5);
-							
-							//update last_campaign
-							$q14 = 'UPDATE subscribers SET last_campaign = '.$campaign_id.' WHERE id = '.$subscriber_id;
-							mysqli_query($mysqli, $q14);
-						}
+						//Always increment recipient count
+						//increment recipients number in campaigns table
+						$q5 = 'UPDATE campaigns SET recipients = recipients+1 WHERE id = '.$campaign_id;
+						mysqli_query($mysqli, $q5);
+						
+						//update last_campaign
+						$q14 = 'UPDATE subscribers SET last_campaign = '.$campaign_id.' WHERE id = '.$subscriber_id;
+						mysqli_query($mysqli, $q14);
 						
 						$emails_sent_this_run++;
 				    }  
@@ -895,11 +892,11 @@
 					{
 						while($row = mysqli_fetch_array($r12)) {
 							$current_recipient_count = $row['recipients'];
-							$to_send = $row['to_send'];
+							$to_send_actual = $row['to_send'];
 						}
 						
 						// If more emails to send, trigger next batch
-						if($current_recipient_count < $to_send)
+						if($current_recipient_count < $to_send_actual)
 						{
 							// Release cron lock before triggering next run
 							mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
@@ -914,8 +911,12 @@
 							curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
 							curl_exec($ch);
 							curl_close($ch);
+							
+							// IMPORTANT: Exit immediately to prevent post-processing
 							exit;
 						}
+						// If we reach here, campaign is complete - continue to post-processing
+						$no_of_recipients = $current_recipient_count;
 					}
 				    //======================= /Send remaining in queue ======================//
 				}
@@ -927,14 +928,23 @@
 					{
 						$to_send = $current_recipient_count;
 						$to_send_num = $current_recipient_count;
+						$no_of_recipients = $current_recipient_count;
 					}
 				}
 				
 				//=========================== Post processing ===========================//
+				// Only reached if campaign is truly complete
 				    
-			    $q8 = 'SELECT recipients FROM campaigns where id = '.$campaign_id;
+			    // Refresh recipient count one final time
+			    $q8 = 'SELECT recipients, to_send FROM campaigns where id = '.$campaign_id;
 			    $r8 = mysqli_query($mysqli, $q8);
-			    if ($r8) while($row = mysqli_fetch_array($r8)) $no_of_recipients = $row['recipients'];
+			    if ($r8) {
+			    	while($row = mysqli_fetch_array($r8)) {
+			    		$no_of_recipients = $row['recipients'];
+			    		$to_send = $row['to_send'];
+			    	}
+			    }
+			    // Only do post-processing if campaign is truly complete
 			    if($no_of_recipients >= $to_send)
 			    {
 				    //tags for subject to me
