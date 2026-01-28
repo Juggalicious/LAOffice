@@ -1,8 +1,8 @@
 <?php 
-	// Set very conservative execution time to stay well under cron interval
-	// Goal: Finish in ~2 minutes, leave 3 minutes before next cron
-	set_time_limit(120); // 2 minutes hard limit
-	ini_set('max_execution_time', 120);
+	// OPTIMIZED FOR 1-MINUTE CRON INTERVALS
+	// Must finish in under 50 seconds to avoid overlap
+	set_time_limit(60); // 1 minute hard limit
+	ini_set('max_execution_time', 60);
 	ini_set('display_errors', 0);
 	ini_set('memory_limit', '256M');
 	
@@ -15,7 +15,7 @@
 	
 	// Track script start time to prevent timeout
 	$script_start_time = time();
-	$max_execution_seconds = 90; // Exit after 1.5 minutes to leave huge buffer
+	$max_execution_seconds = 50; // Exit after 50 seconds (10 sec buffer for 1-min cron)
 	
 	//--------------------------------------------------------------//
 	function dbConnect() { //Connect to database
@@ -61,8 +61,9 @@
 	if (!$r) error_log("[Unable to set sql_mode]".mysqli_error($mysqli).': in '.__FILE__.' on line '.__LINE__);
 
 	// File-based locking system (no database changes needed)
+	// Optimized for 1-minute cron intervals
 	$lock_file = sys_get_temp_dir() . '/sendy_cron.lock';
-	$lock_timeout = 300; // 5 minutes
+	$lock_timeout = 120; // 2 minutes (stale if runs longer than 2 cron cycles)
 	
 	// Check if lock file exists and is stale
 	if (file_exists($lock_file)) {
@@ -380,9 +381,9 @@
 					$the_offset = ' OFFSET '.($offset-($currently_unsubscribed+$currently_bounced+$currently_complaint));	
 				}
 				
-				// Batch processing to prevent timeout
-				// Very small batch = faster execution = completes before next cron
-				$batch_size = 25; // Process 25 emails at a time (very conservative)
+				// Batch processing optimized for 1-MINUTE cron intervals
+				// Goal: Send emails in ~40 seconds, finish in 50 seconds total
+				$batch_size = 10; // Very small batches to complete quickly
 				$emails_sent_this_run = 0;
 				
 				//Replace links in newsletter and put tracking image
@@ -833,8 +834,8 @@
 						
 						$emails_sent_this_run++;
 						
-						// Check timeout more frequently (every 10 emails)
-						if($emails_sent_this_run % 10 == 0) {
+						// Check timeout very frequently for 1-minute cron (every 5 emails)
+						if($emails_sent_this_run % 5 == 0) {
 							if((time() - $script_start_time) > $max_execution_seconds) {
 								// Save progress and exit
 								$q_save = 'UPDATE campaigns SET send_date = "0", timezone = "0" WHERE id = '.$campaign_id;
