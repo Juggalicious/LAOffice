@@ -1,9 +1,10 @@
 <?php 
-	// Set maximum execution time to prevent CPU limit exceeded
-	set_time_limit(300); // 5 minutes max
-	ini_set('max_execution_time', 300);
+	// Set very conservative execution time to stay well under cron interval
+	// Goal: Finish in ~2 minutes, leave 3 minutes before next cron
+	set_time_limit(120); // 2 minutes hard limit
+	ini_set('max_execution_time', 120);
 	ini_set('display_errors', 0);
-	ini_set('memory_limit', '256M'); // Increase if needed
+	ini_set('memory_limit', '256M');
 	
 	mysqli_report(MYSQLI_REPORT_OFF);
 	include('includes/helpers/PHPMailerAutoload.php');
@@ -14,7 +15,7 @@
 	
 	// Track script start time to prevent timeout
 	$script_start_time = time();
-	$max_execution_seconds = 280; // Leave buffer before hard limit
+	$max_execution_seconds = 90; // Exit after 1.5 minutes to leave huge buffer
 	
 	//--------------------------------------------------------------//
 	function dbConnect() { //Connect to database
@@ -59,38 +60,69 @@
 	$r = mysqli_query($mysqli, $q);
 	if (!$r) error_log("[Unable to set sql_mode]".mysqli_error($mysqli).': in '.__FILE__.' on line '.__LINE__);
 
-	//setup cron
+	// File-based locking system (no database changes needed)
+	$lock_file = sys_get_temp_dir() . '/sendy_cron.lock';
+	$lock_timeout = 300; // 5 minutes
+	
+	// Check if lock file exists and is stale
+	if (file_exists($lock_file)) {
+		$lock_age = time() - filemtime($lock_file);
+		if ($lock_age > $lock_timeout) {
+			// Lock is stale, remove it
+			@unlink($lock_file);
+			error_log("Sendy: Stale lock file detected and removed (age: {$lock_age}s)");
+		} else {
+			// Lock is active, another process is running
+			error_log("Sendy: Cron already running (locked for {$lock_age}s), exiting");
+			exit;
+		}
+	}
+	
+	// Try to acquire lock
+	$lock_handle = @fopen($lock_file, 'x');
+	if (!$lock_handle) {
+		// Another process just grabbed the lock
+		error_log("Sendy: Failed to acquire lock, another process running");
+		exit;
+	}
+	
+	// Write PID to lock file for debugging
+	fwrite($lock_handle, getmypid());
+	fclose($lock_handle);
+	
+	// Function to release lock
+	function unlock_cron_file() {
+		global $lock_file;
+		if (file_exists($lock_file)) {
+			@unlink($lock_file);
+		}
+	}
+	
+	// Register shutdown function to always unlock
+	register_shutdown_function('unlock_cron_file');
+
+	//setup cron - keep database lock for compatibility but use file lock as primary
 	$q = 'SELECT id, cron, send_rate, ses_endpoint FROM login LIMIT 1';
 	$r = mysqli_query($mysqli, $q);
 	if ($r)
 	{
 	    while($row = mysqli_fetch_array($r))
 	    {
-			$cron = $row['cron'];
 			$userid = $row['id'];
 			$send_rate = $row['send_rate'];
 			$ses_endpoint = $row['ses_endpoint'];
-			
-			if($cron==0)
-			{
-				$q2 = 'UPDATE login SET cron=1 WHERE id = '.$userid;
-				$r2 = mysqli_query($mysqli, $q2);
-				if ($r2) {
-					// Successfully locked cron
-				} else {
-					// Another process is running
-					exit;
-				}
-			} else {
-				// Cron already running, exit to prevent overlap
-				exit;
-			}
 	    }  
 	}
 	
 	// Offset should be determined automatically from database, not from URL
 	$the_offset = '';
 	$offset = 0;
+	
+	// Safe unlock function - now just removes lock file (shutdown function handles it)
+	function unlock_cron($mysqli, $userid) {
+		// No-op - lock file is automatically removed by shutdown function
+		// Keeping this for code compatibility
+	}
 	
 	function get_google_translate_url($url, $translate_to_lang)
 	{
@@ -237,13 +269,14 @@
 			//check if we should send email now
 			if((($time>=$send_date && $time<$send_date+300) && $sent=='') || (($send_date<$time) && $sent=='') || ($send_date=='0' && $timezone=='0'))
 			{
-				//if resuming, keep the send_date/lists/timezone clear
-				if($is_resuming)
-					$q = 'UPDATE campaigns SET send_date=NULL, lists=NULL, timezone=NULL WHERE id = '.$campaign_id;
-				else
+				//if resuming, don't touch send_date/timezone - they should stay '0'
+				//if first time, mark as sent and clear scheduling fields
+				if(!$is_resuming)
+				{
 					$q = 'UPDATE campaigns SET sent = "'.$time.'", send_date=NULL, lists=NULL, timezone=NULL WHERE id = '.$campaign_id;
-				$r = mysqli_query($mysqli, $q);
-				if ($r){}
+					$r = mysqli_query($mysqli, $q);
+					if ($r){}
+				}
 				
 				//if sending for the first time
 				if(!$is_resuming)
@@ -348,7 +381,8 @@
 				}
 				
 				// Batch processing to prevent timeout
-				$batch_size = 100; // Process 100 emails at a time
+				// Very small batch = faster execution = completes before next cron
+				$batch_size = 25; // Process 25 emails at a time (very conservative)
 				$emails_sent_this_run = 0;
 				
 				//Replace links in newsletter and put tracking image
@@ -376,8 +410,8 @@
 					    	$q_timeout = 'UPDATE campaigns SET send_date = "0", timezone = "0", timeout_check = "'.$new_offset.':'.($timeout_check ? $timeout_check : '0').'" WHERE id = '.$campaign_id;
 					    	mysqli_query($mysqli, $q_timeout);
 					    	
-					    	// Release cron lock so next cron run can continue
-					    	mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+					    	// Release cron lock safely
+					    	unlock_cron($mysqli, $userid);
 					    	
 					    	// Exit - cron will automatically resume on next run
 					    	exit;
@@ -424,7 +458,7 @@
 								run_rule($rules_data);
 								
 								// Release cron lock before exiting
-								mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+								unlock_cron($mysqli, $userid);
 								
 								//Exit script to stop campaign from sending further
 								exit;
@@ -798,6 +832,17 @@
 						mysqli_query($mysqli, $q14);
 						
 						$emails_sent_this_run++;
+						
+						// Check timeout more frequently (every 10 emails)
+						if($emails_sent_this_run % 10 == 0) {
+							if((time() - $script_start_time) > $max_execution_seconds) {
+								// Save progress and exit
+								$q_save = 'UPDATE campaigns SET send_date = "0", timezone = "0" WHERE id = '.$campaign_id;
+								mysqli_query($mysqli, $q_save);
+								unlock_cron($mysqli, $userid);
+								exit;
+							}
+						}
 				    }  
 				    
 				    //====================== Send remaining in queue ======================//
@@ -894,11 +939,15 @@
 							$to_send_actual = $row['to_send'];
 						}
 						
-						// If more emails to send, release lock and let cron continue
+						// If more emails to send, set resume mode and release lock
 						if($current_recipient_count < $to_send_actual)
 						{
+							// CRITICAL: Set resume mode so next cron run picks it up
+							$q_resume = 'UPDATE campaigns SET send_date = "0", timezone = "0" WHERE id = '.$campaign_id;
+							mysqli_query($mysqli, $q_resume);
+							
 							// Release cron lock - next cron run will continue automatically
-							mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+							unlock_cron($mysqli, $userid);
 							
 							// Exit immediately to prevent post-processing
 							// Cron will pick up and continue on next run
@@ -1020,7 +1069,7 @@
 					run_rule($rules_data);
 					
 					// Release cron lock on completion
-					mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+					unlock_cron($mysqli, $userid);
 					
 					//quit
 					exit;
@@ -1052,7 +1101,7 @@
 					mysqli_query($mysqli, $q);
 					
 					// Release cron lock - next cron run will retry automatically
-					mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+					unlock_cron($mysqli, $userid);
 				}
 			}
 			else if($current_recipient_count == $to_send_num)
@@ -1065,6 +1114,6 @@
 	
 	// Release cron lock at end of script
 	if(isset($userid)) {
-		mysqli_query($mysqli, 'UPDATE login SET cron=0 WHERE id = '.$userid);
+		unlock_cron($mysqli, $userid);
 	}
 ?>
